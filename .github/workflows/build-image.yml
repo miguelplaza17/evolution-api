@@ -1,0 +1,69 @@
+name: build-image
+
+# Constrói a imagem deste fork e publica no GHCR (sempre) e no Docker Hub
+# (só se os secrets DOCKERHUB_USERNAME/DOCKERHUB_TOKEN existirem).
+#
+# O GHCR não precisa de configuração nenhuma — usa o GITHUB_TOKEN do próprio
+# workflow. O Docker Hub precisa de um Access Token criado em
+# hub.docker.com > Account Settings > Personal access tokens, salvo em
+# Settings > Secrets and variables > Actions deste repositório.
+
+on:
+  push:
+    branches:
+      - '2.3.7-baileys-rc13'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Docker Hub é opcional: sem os secrets, este passo é pulado e só o GHCR
+      # recebe a imagem.
+      - name: Login no Docker Hub (opcional)
+        id: dockerhub
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Monta a lista de tags
+        id: tags
+        run: |
+          SHA_SHORT=$(git rev-parse --short HEAD)
+          TAGS="ghcr.io/${{ github.repository_owner }}/evolution-api:2.3.7-baileys-rc13"
+          TAGS="$TAGS,ghcr.io/${{ github.repository_owner }}/evolution-api:2.3.7-baileys-rc13-$SHA_SHORT"
+          if [ "${{ steps.dockerhub.outcome }}" = "success" ]; then
+            TAGS="$TAGS,${{ secrets.DOCKERHUB_USERNAME }}/evolution-api:2.3.7-baileys-rc13"
+            TAGS="$TAGS,${{ secrets.DOCKERHUB_USERNAME }}/evolution-api:2.3.7-baileys-rc13-$SHA_SHORT"
+          fi
+          echo "list=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "Tags: $TAGS"
+
+      - name: Build e push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # O servidor é x86_64. Acrescente linux/arm64 se um dia precisar —
+          # dobra o tempo de build, então não vale por padrão.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
