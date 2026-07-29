@@ -15,7 +15,7 @@ name: build-image
 on:
   push:
     branches:
-      - '2.3.7-baileys-rc13'
+      - '2.3.7-baileys-rc14'
   workflow_dispatch:
 
 jobs:
@@ -52,7 +52,7 @@ jobs:
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           SHA_SHORT=$(git rev-parse --short HEAD)
-          BASE="2.3.7-baileys-rc13"
+          BASE="2.3.7-baileys-rc14"
           TAGS="ghcr.io/$OWNER/evolution-api:$BASE"
           TAGS="$TAGS,ghcr.io/$OWNER/evolution-api:$BASE-$SHA_SHORT"
           if [ -n "$DOCKERHUB_USERNAME" ]; then

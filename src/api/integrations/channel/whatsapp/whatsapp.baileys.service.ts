@@ -82,7 +82,7 @@ import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
-import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
+import { makeProxyAgent } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
@@ -599,7 +599,15 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.logger.info(`Group Ignore: ${this.localSettings.groupsIgnore}`);
 
-    let options;
+    // `agent` (WebSocket) e `fetchAgent` (upload de mídia) precisam AMBOS ser agents
+    // clássicos (estilo `http.Agent`). Da baileys rc13 em diante o upload de mídia usa
+    // `uploadWithNodeHttp`, que repassa o `fetchAgent` cru para `node:https` — um
+    // `ProxyAgent` do undici é recusado com `ERR_INVALID_ARG_TYPE` e o envio morre em
+    // todos os hosts de CDN ("Media upload failed on all hosts"). O tipo declarado em
+    // `SocketConfig` sempre foi `import('https').Agent`; o undici passava batido porque
+    // este objeto era `any` implícito. São duas instâncias para não compartilhar o pool
+    // de sockets entre a conexão WS (longa) e os uploads.
+    let options: Partial<UserFacingSocketConfig>;
 
     if (this.localProxy?.enabled) {
       this.logger.info('Proxy enabled: ' + this.localProxy?.host);
@@ -611,26 +619,22 @@ export class BaileysStartupService extends ChannelStartupService {
           const proxyUrls = text.split('\r\n');
           const rand = Math.floor(Math.random() * Math.floor(proxyUrls.length));
           const proxyUrl = 'http://' + proxyUrls[rand];
-          options = { agent: makeProxyAgent(proxyUrl), fetchAgent: makeProxyAgentUndici(proxyUrl) };
+          options = { agent: makeProxyAgent(proxyUrl), fetchAgent: makeProxyAgent(proxyUrl) };
         } catch {
           this.localProxy.enabled = false;
         }
       } else {
+        const proxy = {
+          host: this.localProxy.host,
+          port: this.localProxy.port,
+          protocol: this.localProxy.protocol,
+          username: this.localProxy.username,
+          password: this.localProxy.password,
+        };
+
         options = {
-          agent: makeProxyAgent({
-            host: this.localProxy.host,
-            port: this.localProxy.port,
-            protocol: this.localProxy.protocol,
-            username: this.localProxy.username,
-            password: this.localProxy.password,
-          }),
-          fetchAgent: makeProxyAgentUndici({
-            host: this.localProxy.host,
-            port: this.localProxy.port,
-            protocol: this.localProxy.protocol,
-            username: this.localProxy.username,
-            password: this.localProxy.password,
-          }),
+          agent: makeProxyAgent(proxy),
+          fetchAgent: makeProxyAgent(proxy),
         };
       }
     }
