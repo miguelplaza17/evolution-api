@@ -1479,10 +1479,20 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(messageRaw);
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
+          // O webhook expõe o telefone em `remoteJid` porque os consumidores existentes
+          // esperam `@s.whatsapp.net`. Mas TROCA em vez de sobrescrever: o LID sobrevive
+          // em `remoteJidAlt`, que é justamente o campo do endereço alternativo.
+          //
+          // Antes, os dois campos saíam com o mesmo telefone e o LID se perdia no
+          // webhook — embora a key original continue íntegra no banco (gravada acima,
+          // em message.create/update). Sem o LID no payload, um consumidor não tem como
+          // endereçar `<lid>@lid`, e o envio para conta migrada volta com status 0 e
+          // stub 463 ("Your account has been restricted"): a mensagem não é entregue.
           if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
+            const lid = messageRaw.key.remoteJid;
             messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
+            messageRaw.key.remoteJidAlt = lid;
           }
-          console.log(messageRaw);
 
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
