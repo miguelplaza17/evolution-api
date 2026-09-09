@@ -355,6 +355,14 @@ export class InstanceController {
       if (state === 'close') {
         throw new BadRequestException('The "' + instanceName + '" instance is not connected');
       }
+
+      // Em 'connecting' a instância está exibindo QR. Reiniciar aqui derruba o socket,
+      // invalida o QR que o cliente está escaneando e incrementa `qrcode.count` (que
+      // só zera em `no.connection`) até QRCODE_LIMIT, quando a instância é deslogada.
+      if (state === 'connecting') {
+        throw new BadRequestException('The "' + instanceName + '" instance is waiting for QR code scan');
+      }
+
       this.logger.info(`Restarting instance: ${instanceName}`);
 
       if (typeof instance.restart === 'function') {

@@ -699,6 +699,21 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
 
+    // Todo caminho que chega aqui substitui `this.client` (reconexão, reloadConnection,
+    // restart). Se o anterior ainda estiver vivo ele viraria órfão: socket aberto e
+    // handlers de evento ligados, processando mensagens e disparando webhook em
+    // duplicidade. Desligar o `connection.update` antes do `end` evita que o close
+    // do antigo caia no `connectionUpdate` e dispare uma segunda reconexão.
+    const previous = this.client;
+    if (previous) {
+      try {
+        previous.ev.removeAllListeners('connection.update');
+        previous.end(undefined);
+      } catch (error) {
+        this.logger.warn(`Falha ao encerrar socket anterior de ${this.instance.name}: ${error?.toString()}`);
+      }
+    }
+
     this.client = makeWASocket(socketConfig);
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
@@ -750,6 +765,21 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
     }
+  }
+
+  /**
+   * Restart de instância conectada. Encerra o socket com `restartRequired` (515), o
+   * mesmo código que o WhatsApp usa após o pareamento, e deixa o `connectionUpdate`
+   * fazer a reconexão. Antes o controller fazia `end(new Error('restart'))` e ainda
+   * chamava `connectToWhatsapp` por cima: o erro sem statusCode caía no caminho de
+   * reconexão do `connectionUpdate` e, dependendo da ordem dos microtasks, nasciam
+   * dois sockets para a mesma instância.
+   */
+  public async restart(): Promise<void> {
+    if (!this.client) {
+      throw new BadRequestException('Instance has no active client');
+    }
+    await this.client.end(new Boom('Restart requested', { statusCode: DisconnectReason.restartRequired }));
   }
 
   private readonly chatHandle = {
