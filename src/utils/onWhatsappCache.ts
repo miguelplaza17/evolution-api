@@ -65,6 +65,24 @@ interface ISaveOnWhatsappCacheParams {
   lid?: 'lid' | undefined;
 }
 
+/**
+ * `jidOptions` é uma lista separada por vírgula. Um `contains` cru é match de
+ * substring: `551998325334@s.whatsapp.net` (DDD 19) é substring de
+ * `5551998325334@s.whatsapp.net` (DDD 51), então a busca de um número achava o
+ * registro do outro, o update misturava os JIDs dos dois na mesma linha e o
+ * lookup passava a devolver o remoteJid errado. Casa só o token inteiro.
+ */
+function jidOptionsHas(jid: string) {
+  return {
+    OR: [
+      { jidOptions: jid },
+      { jidOptions: { startsWith: `${jid},` } },
+      { jidOptions: { endsWith: `,${jid}` } },
+      { jidOptions: { contains: `,${jid},` } },
+    ],
+  };
+}
+
 function normalizeJid(jid: string | null | undefined): string | null {
   if (!jid) return null;
   return jid.startsWith('+') ? jid.slice(1) : jid;
@@ -101,7 +119,7 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
       const existingRecord = await prismaRepository.isOnWhatsapp.findFirst({
         where: {
           OR: [
-            ...expandedJids.map((jid) => ({ jidOptions: { contains: jid } })),
+            ...expandedJids.map((jid) => jidOptionsHas(jid)),
             { remoteJid: remoteJid }, // TODO: Descobrir o motivo que causa o remoteJid não estar (às vezes) incluso na lista de jidOptions
           ],
         },
@@ -164,9 +182,20 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
         logger.verbose(
           `[saveOnWhatsappCache] Register does not exist, creating: remoteJid=${remoteJid}, jidOptions=${dataPayload.jidOptions}, lid=${dataPayload.lid}`,
         );
-        await prismaRepository.isOnWhatsapp.create({
-          data: dataPayload,
-        });
+        try {
+          await prismaRepository.isOnWhatsapp.create({
+            data: dataPayload,
+          });
+        } catch (createError) {
+          // Os itens rodam em paralelo (allSettled): dois deles podem resolver para o
+          // mesmo remoteJid, o segundo create estoura a unique. Vira update.
+          if (createError?.code !== 'P2002') throw createError;
+          logger.verbose(`[saveOnWhatsappCache] Race on create for ${remoteJid}, updating instead.`);
+          await prismaRepository.isOnWhatsapp.update({
+            where: { remoteJid },
+            data: { jidOptions: dataPayload.jidOptions, lid: dataPayload.lid },
+          });
+        }
       }
     } catch (e) {
       // Loga o erro mas não para a execução dos outros promises
@@ -192,7 +221,7 @@ export async function getOnWhatsappCache(remoteJids: string[]) {
 
     const onWhatsappCache = await prismaRepository.isOnWhatsapp.findMany({
       where: {
-        OR: remoteJidsWithoutPlus.map((remoteJid) => ({ jidOptions: { contains: remoteJid } })),
+        OR: remoteJidsWithoutPlus.map((remoteJid) => jidOptionsHas(remoteJid)),
         updatedAt: {
           gte: dayjs().subtract(configService.get<Database>('DATABASE').SAVE_DATA.IS_ON_WHATSAPP_DAYS, 'days').toDate(),
         },
