@@ -82,7 +82,7 @@ import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
-import { makeProxyAgent } from '@utils/makeProxyAgent';
+import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
@@ -257,6 +257,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
 
   public stateConnection: wa.StateConnection = { state: 'close' };
+
+  // Terceiro argumento de `downloadMediaMessage`/`downloadContentFromMessage`. O Baileys
+  // baixa mídia recebida com `fetch` nativo, que só aceita dispatcher undici — o
+  // `agent` clássico do socket não vale aqui. Sem isso o download sai com o IP real do
+  // servidor enquanto a sessão está no IP do proxy. Vazio quando o proxy está desligado.
+  private mediaDownloadOptions: { options?: RequestInit & { dispatcher?: unknown } } = {};
 
   public phoneNumber: string;
 
@@ -619,9 +625,16 @@ export class BaileysStartupService extends ChannelStartupService {
           const proxyUrls = text.split('\r\n');
           const rand = Math.floor(Math.random() * Math.floor(proxyUrls.length));
           const proxyUrl = 'http://' + proxyUrls[rand];
-          options = { agent: makeProxyAgent(proxyUrl), fetchAgent: makeProxyAgent(proxyUrl) };
+          const dispatcher = makeProxyAgentUndici(proxyUrl);
+          options = {
+            agent: makeProxyAgent(proxyUrl),
+            fetchAgent: makeProxyAgent(proxyUrl),
+            options: { dispatcher } as any,
+          };
+          this.mediaDownloadOptions = { options: { dispatcher } };
         } catch {
           this.localProxy.enabled = false;
+          this.mediaDownloadOptions = {};
         }
       } else {
         const proxy = {
@@ -632,11 +645,20 @@ export class BaileysStartupService extends ChannelStartupService {
           password: this.localProxy.password,
         };
 
+        // `options.dispatcher` cobre os `fetch` internos do Baileys que tocam domínio do
+        // WhatsApp (foto de perfil, mídia recebida). As URLs próprias (S3, backend) são
+        // baixadas pela Evolution sem proxy e entregues em buffer — o WhatsApp não vê
+        // esse tráfego, só o upload seguinte, que já sai pelo `fetchAgent`.
+        const dispatcher = makeProxyAgentUndici(proxy);
         options = {
           agent: makeProxyAgent(proxy),
           fetchAgent: makeProxyAgent(proxy),
+          options: { dispatcher } as any,
         };
+        this.mediaDownloadOptions = { options: { dispatcher } };
       }
+    } else {
+      this.mediaDownloadOptions = {};
     }
 
     const socketConfig: UserFacingSocketConfig = {
@@ -1481,7 +1503,7 @@ export class BaileysStartupService extends ChannelStartupService {
                 const buffer = await downloadMediaMessage(
                   { key: received.key, message: received?.message },
                   'buffer',
-                  {},
+                  this.mediaDownloadOptions,
                   { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
                 );
 
@@ -1492,7 +1514,7 @@ export class BaileysStartupService extends ChannelStartupService {
                   const buffer = await downloadMediaMessage(
                     { key: received.key, message: received?.message },
                     'buffer',
-                    {},
+                    this.mediaDownloadOptions,
                     { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
                   );
 
@@ -2559,7 +2581,7 @@ export class BaileysStartupService extends ChannelStartupService {
             const buffer = await downloadMediaMessage(
               { key: messageRaw.key, message: messageRaw?.message },
               'buffer',
-              {},
+              this.mediaDownloadOptions,
               { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
             );
 
@@ -2570,7 +2592,7 @@ export class BaileysStartupService extends ChannelStartupService {
               const buffer = await downloadMediaMessage(
                 { key: messageRaw.key, message: messageRaw?.message },
                 'buffer',
-                {},
+                this.mediaDownloadOptions,
                 { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
               );
 
@@ -2787,6 +2809,33 @@ export class BaileysStartupService extends ChannelStartupService {
     return statusSent;
   }
 
+  /**
+   * Baixa uma URL fornecida pelo consumidor (S3, backend) para envio. Sem proxy de
+   * propósito: o WhatsApp nunca vê este tráfego, só o upload seguinte, que já sai
+   * pelo `fetchAgent`. Passar isto pelo proxy só gastaria banda do NodeMaven.
+   */
+  private async fetchOwnMediaUrl(url: string): Promise<Buffer> {
+    const response = await axios.get(url, { responseType: 'arraybuffer' });
+    return Buffer.from(response.data, 'binary');
+  }
+
+  /**
+   * Content-Type de uma URL própria via HEAD. Antes era um GET com `arraybuffer`
+   * só para ler o header: baixava o arquivo inteiro uma segunda vez. Servidor que
+   * não responde HEAD cai no GET.
+   */
+  private async fetchOwnMediaMimetype(url: string): Promise<string | false> {
+    try {
+      const head = await axios.head(url);
+      const type = head.headers['content-type'] as string | undefined;
+      if (type) return type;
+    } catch {
+      // segue pro GET
+    }
+    const response = await axios.get(url, { responseType: 'arraybuffer' });
+    return (response.headers['content-type'] as string) || false;
+  }
+
   private async prepareMediaMessage(mediaMessage: MediaMessage) {
     try {
       const type = mediaMessage.mediatype === 'ptv' ? 'video' : mediaMessage.mediatype;
@@ -2795,23 +2844,7 @@ export class BaileysStartupService extends ChannelStartupService {
       if (mediaMessage.mediatype === 'image') {
         let imageBuffer: Buffer;
         if (isURL(mediaMessage.media)) {
-          let config: any = { responseType: 'arraybuffer' };
-
-          if (this.localProxy?.enabled) {
-            config = {
-              ...config,
-              httpsAgent: makeProxyAgent({
-                host: this.localProxy.host,
-                port: this.localProxy.port,
-                protocol: this.localProxy.protocol,
-                username: this.localProxy.username,
-                password: this.localProxy.password,
-              }),
-            };
-          }
-
-          const response = await axios.get(mediaMessage.media, config);
-          imageBuffer = Buffer.from(response.data, 'binary');
+          imageBuffer = await this.fetchOwnMediaUrl(mediaMessage.media);
         } else {
           imageBuffer = Buffer.from(mediaMessage.media, 'base64');
         }
@@ -2820,8 +2853,10 @@ export class BaileysStartupService extends ChannelStartupService {
         mediaMessage.fileName ??= 'image.jpg';
         mediaMessage.mimetype = 'image/jpeg';
       } else {
+        // Em buffer, e não `{ url }`: com `{ url }` o Baileys baixaria com o `fetch`
+        // dele, agora atrás do `options.dispatcher`, gastando proxy numa URL nossa.
         mediaInput = isURL(mediaMessage.media)
-          ? { url: mediaMessage.media }
+          ? await this.fetchOwnMediaUrl(mediaMessage.media)
           : Buffer.from(mediaMessage.media, 'base64');
       }
 
@@ -2856,24 +2891,7 @@ export class BaileysStartupService extends ChannelStartupService {
         mimetype = mimeTypes.lookup(mediaMessage.fileName);
 
         if (!mimetype && isURL(mediaMessage.media)) {
-          let config: any = { responseType: 'arraybuffer' };
-
-          if (this.localProxy?.enabled) {
-            config = {
-              ...config,
-              httpsAgent: makeProxyAgent({
-                host: this.localProxy.host,
-                port: this.localProxy.port,
-                protocol: this.localProxy.protocol,
-                username: this.localProxy.username,
-                password: this.localProxy.password,
-              }),
-            };
-          }
-
-          const response = await axios.get(mediaMessage.media, config);
-
-          mimetype = response.headers['content-type'] as string;
+          mimetype = await this.fetchOwnMediaMimetype(mediaMessage.media);
         }
       }
 
@@ -3943,7 +3961,7 @@ export class BaileysStartupService extends ChannelStartupService {
         buffer = await downloadMediaMessage(
           { key: msg?.key, message: msg?.message },
           'buffer',
-          {},
+          this.mediaDownloadOptions,
           { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
         );
       } catch {
@@ -3960,7 +3978,7 @@ export class BaileysStartupService extends ChannelStartupService {
               url: `https://mmg.whatsapp.net${msg?.message?.[mediaType]?.directPath}`,
             },
             await this.mapMediaType(mediaType),
-            {},
+            this.mediaDownloadOptions,
           );
           const chunks = [];
           for await (const chunk of media) {
