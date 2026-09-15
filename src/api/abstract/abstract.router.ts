@@ -17,6 +17,24 @@ type DataValidate<T> = {
 
 const logger = new Logger('Validate');
 
+// Campos que identificam a instância já autenticada pelo auth.guard a partir de
+// `req.params.instanceName`. Nunca podem ser reescritos por entrada não confiável
+// (query string), senão o chamador escolhe em qual instância a rota executa.
+const PROTECTED_INSTANCE_FIELDS = ['instanceName', 'instanceId'] as const;
+
+function sanitizeUntrustedInput(source: Record<string, any> | undefined): Record<string, any> {
+  if (!source || typeof source !== 'object') return {};
+  const sanitized: Record<string, any> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if ((PROTECTED_INSTANCE_FIELDS as readonly string[]).includes(key)) {
+      logger.warn(`Ignoring attempt to override protected field "${key}" via untrusted input`);
+      continue;
+    }
+    sanitized[key] = value;
+  }
+  return sanitized;
+}
+
 export abstract class RouterBroker {
   constructor() {}
   public routerPath(path: string, param = true) {
@@ -33,8 +51,18 @@ export abstract class RouterBroker {
     const body = request.body;
     const instance = request.params as unknown as InstanceDto;
 
+    // Só há o que proteger quando a rota carrega `:instanceName` no path: foi esse
+    // valor que o auth.guard autenticou contra o token. Rotas sem o param
+    // (`/instance/create`, `/instance/fetchInstances`) recebem o nome legitimamente
+    // por query/body e são escopadas de outro jeito — a API key global no create, o
+    // `where: { token: key }` no fetchInstances. Sanitizar essas duas as quebraria.
+    const hasAuthenticatedInstance = Boolean(instance?.instanceName);
+
     if (request?.query && Object.keys(request.query).length > 0) {
-      Object.assign(instance, request.query);
+      Object.assign(
+        instance,
+        hasAuthenticatedInstance ? sanitizeUntrustedInput(request.query as Record<string, any>) : request.query,
+      );
     }
 
     if (request.originalUrl.includes('/instance/create')) {
