@@ -251,6 +251,13 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private lastStream515At = 0;
+
+  // Depois de um `stream:error` 515 ("restart needed") o WhatsApp costuma fechar a
+  // conexão com `loggedOut` — que ali NÃO é logout de verdade, é o sinal de restart.
+  // Qualquer close que chegue dentro desta janela conta como consequência do 515.
+  private static readonly STREAM_515_RECONNECT_GRACE_MS = 30_000;
+  private static readonly STREAM_ERROR_CODE_RECONNECT = '515';
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -432,7 +439,21 @@ export class BaileysStartupService extends ChannelStartupService {
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
-      const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+
+      // Um `loggedOut` logo depois de um stream:error 515 é o handshake de restart do
+      // WhatsApp, não um logout. Tratar como logout aqui é caro: o caminho `else`
+      // emite `logout.instance`, que chama cleaningUp() — e cleaningUp apaga o
+      // diretório da instância e a sessão do banco. Ou seja, despareia o cliente e
+      // obriga a ler QR de novo. Reconectar à toa custa uma tentativa falha.
+      const recentStream515 = Date.now() - this.lastStream515At < BaileysStartupService.STREAM_515_RECONNECT_GRACE_MS;
+      const shouldReconnect =
+        !codesToNotReconnect.includes(statusCode) || (statusCode === DisconnectReason.loggedOut && recentStream515);
+
+      if (statusCode === DisconnectReason.loggedOut && recentStream515) {
+        this.logger.warn(
+          `Instance "${this.instance.name}" - loggedOut within ${BaileysStartupService.STREAM_515_RECONNECT_GRACE_MS}ms of a stream:error 515, treating as restart and reconnecting`,
+        );
+      }
       if (shouldReconnect) {
         await this.connectToWhatsapp(this.phoneNumber);
       } else {
@@ -754,6 +775,12 @@ export class BaileysStartupService extends ChannelStartupService {
       console.log('CB:ack,class:call', packet);
       const payload = { event: 'CB:ack,class:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
+    });
+
+    this.client.ws.on('CB:stream:error', (node: { attrs?: { code?: string | number } }) => {
+      if (String(node?.attrs?.code) === BaileysStartupService.STREAM_ERROR_CODE_RECONNECT) {
+        this.lastStream515At = Date.now();
+      }
     });
 
     this.phoneNumber = number;
