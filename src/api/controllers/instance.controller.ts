@@ -464,7 +464,20 @@ export class InstanceController {
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) waInstances?.clearCacheChatwoot();
 
       if (instance.state === 'connecting' || instance.state === 'open') {
-        await this.logout({ instanceName });
+        try {
+          await this.logout({ instanceName });
+        } catch (error) {
+          // O logout estoura "Connection Closed" quando o socket do Baileys já
+          // morreu mas waInstances[name] ainda existe. Precisamos seguir até o
+          // emit de remove.instance abaixo — é o único caminho que limpa a
+          // entrada em memória e roda o cleaningUp(). Sem este catch a entrada
+          // fica zumbi até o processo reiniciar.
+          this.logger.warn({
+            message: 'logout failed during deleteInstance — proceeding with cleanup',
+            instanceName,
+            error,
+          });
+        }
       }
 
       try {
